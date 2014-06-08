@@ -3,11 +3,14 @@
 
 # Import
 import logging
-
-import re
-
 import pickle
 import time
+import socket
+import threading
+import queue
+import tkinter
+import tkinter.scrolledtext
+import tkinter.messagebox
 
 # Logging
 from logging import FATAL, CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET
@@ -39,6 +42,12 @@ def decode(message) -> dict:
     return pickle.loads(message)
         
 # Server
+try:
+    IP = socket.gethostbyname(socket.gethostname())
+except:
+    logging.log(WARNING, "could not determine local ip")
+    IP = ""
+PORT = 50000
 SIZE = 1024
 
 class Handler:
@@ -57,7 +66,7 @@ class Handler:
 
     def __repr__(self):
         """Return repr(handler)."""
-        return "Handler<%s>" % ":".join(self.address)
+        return "Handler<%s>" % self.address[0]
 
     # Single
     def send(self, message):
@@ -74,9 +83,10 @@ class Handler:
             try:
                 data = self.socket.recv(SIZE)
                 message = decode(data)
+                message["handler"] = self
                 self.server.messages.put(message)
             except Exception as e:
-                logging.log(ERROR, "%s: %s in recv loop" % (
+                logging.log(ERROR, "%s: %s in recv" % (
                     repr(self), str(e)))
                 self.shutdown()
 
@@ -98,7 +108,7 @@ class Handler:
     
 class Server:
     """Chat server that utilizes handlers to interact with the connected
-    clients (via sockets)."""
+    clients via sockets."""
 
     # Magic
     def __init__(self, address):
@@ -107,7 +117,7 @@ class Server:
         self.messages = queue.Queue()
         self.handlers = list()
         self.active = False
-
+        self.failed = False
         try:
             self.socket = socket.socket()
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -115,20 +125,15 @@ class Server:
             self.socket.listen(5)
             logging.log(DEBUG, "%s: bound" % repr(self))
         except OSError as e:
-            logging.log(FATAL, "%s: could not bind (%s)" % (
-                repr(self), repr(e)))
-        
+            logging.log(FATAL, "%s: could not bind" % repr(self))
+            self.failed = True
         logging.log(DEBUG, "%s: initialized" % repr(self))
 
     def __repr__(self):
         """Return repr(server)."""
-        return "Server<%s>" % ":".join(self.address)
+        return "Server<%s>" % self.address[0]
 
     # Single
-    def handle(self, message):
-        """Handle a message provided by the serv loop."""
-        print(message)
-
     def send(self, message, handler=None):
         """Broadcast a message or send it to a specific handler."""
         if handler:
@@ -147,7 +152,7 @@ class Server:
                 handler = Handler(socket, address, self)
                 handler.activate()
             except Exception as e:
-                logging.log(ERROR, "%s: %s in lstn loop" % (
+                logging.log(ERROR, "%s: %s in lstn" % (
                     repr(self), type(e).__name__))
                 
     def serv(self):
@@ -156,23 +161,27 @@ class Server:
         while self.active:
             try:
                 if not self.messages.empty():
-                    self.handle(self.messages.get())
+                    data = encode(messages.get())
+                    self.send(data)
             except Exception as e:
-                logging.log(ERROR, "%s: %s in serv loop" % (
+                logging.log(ERROR, "%s: %s in serv" % (
                     repr(self), type(e).__name__))
 
     # Main
     def activate(self):
         """Activate the handler."""
+        if self.failed:
+            logging.log(ERROR, "%s cannot be activated")
+            return
         self.active = True
         self.lstn_thread = threading.Thread(target=self.lstn)
         self.lstn_thread.start()
         logging.log(INFO, "%s: activated" % repr(self))
         try:
-            logging.log(INFO, "%s: type ctrl-c to shut down")
-            self.serve()
+            logging.log(INFO, "%s: type ctrl-c to shut down" % repr(self))
+            self.serv()
         except KeyboardInterrupt:
-            logging.log(WARNING, "%s: received ctrl-c shut down signal" %
+            logging.log(INFO, "%s: received ctrl-c" %
                         repr(self))
             self.shutdown()
 
@@ -182,8 +191,70 @@ class Server:
         self.socket.close()
         logging.log(INFO, "%s shut down" % repr(self))
 
+def server():
+    server = Server(("127.0.0.1", 50000))
+    server.activate()
+
 # Client
 class Client:
-    pass
+    """Chat client that interacts with the chat server via sockets."""
 
-# Command
+    # Magic
+    def __init__(self, address, name):
+        """Initialize a new, named client connecting to a server address."""
+        self.address = address
+        self.name = name
+        self.messages = queue.Queue()
+        self.active = False
+        self.failed = False
+        try:
+            self.socket = socket.socket()
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.connect(self.address)
+            logging.log(DEBUG, "%s: bound" % repr(self))
+        except OSError as e:
+            logging.log(FATAL, "%s: could not connect" % repr(self))
+            self.failed = True
+        logging.log(DEBUG, "%s initialized" % repr(self))
+
+    def __repr__(self):
+        """Return repr(self)."""
+        return "Client<%s>" % self.address[0]
+
+    # Single
+    def send(self, message):
+        """Send a message to the connected server."""
+        data = encode(message)
+        self.socket.send(data)
+
+    # Graphical
+    def build(self):
+        self.root = tkinter.Tk()
+        self.root.title("Chat")
+        self.text = tkinter.scrolledtext.ScrolledText(
+            self.root, bd=1, relief="sunken")
+        self.text.pack(fill="both", expand=2)
+        self.entry = tkinter.Entry(self.root, bd=1, relief="sunken")
+        self.entry.pack(fill="x")
+
+    # Loop
+    def recv(self):
+        """Loop receive data from the connected client."""
+        logging.log(DEBUG, "%s: recv loop started" % repr(self))
+        while self.active:
+            try:
+                data = self.socket.recv(SIZE)
+                message = decode(data)
+                self.messages.put(message)
+            except Exception as e:
+                logging.log(ERROR, "%s: %s in recv" % (
+                    repr(self), str(e)))
+                self.shutdown()
+
+    
+    # Main
+    def activate(self):
+        if self.failed:
+            logging.log(ERROR, "%s cannot be activated" % repr(self))
+            return
+
