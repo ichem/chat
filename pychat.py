@@ -1,5 +1,5 @@
-# Chat
-# Noah Kim, Haron Adbaru
+# PyChat
+# Noah K, Haron A
 
 # Import
 import logging
@@ -11,14 +11,13 @@ import queue
 import tkinter
 import tkinter.scrolledtext
 import tkinter.messagebox
-import sys
+import re
 
 # Logging
 from logging import FATAL, CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET
 FORMAT = "%(asctime)s %(levelname)s: %(message)s"
 DATEFMT = "%m/%d/%y %I:%M:%S %p"
 LEVEL = NOTSET
-
 logging.basicConfig(format=FORMAT, datefmt=DATEFMT, level=LEVEL)
 
 # Utility
@@ -28,7 +27,8 @@ def censor(ip, parts=2) -> str:
     return ".".join(ip.split(".")[:-parts] + parts * ["***"])
 
 # Message
-MESSAGE = "[%I:%M %p] *%%(name)s*: %%(message)s"
+CLIENT_MESSAGE = "[%I:%M %p] *%%(name)s*: %%(message)s"
+SERVER_MESSAGE = "[%I:%M %p] %%(message)s"
 
 def Message(**data) -> dict:
     """Convenience function for generating messages. Also generates creation
@@ -42,21 +42,14 @@ def encode(message) -> bytes:
 def decode(message) -> dict:
     """Convenience function for decoding messages for receiving."""
     return pickle.loads(message)
-        
-# Server
-try:
-    IP = socket.gethostbyname(socket.gethostname())
-except:
-    logging.log(WARNING, "could not determine local ip")
-    IP = ""
-PORT = 50000
-SIZE = 1024
 
+# Server
+try: IP, PORT = socket.gethostbyname(socket.gethostname()), 50000
+except: logging.log(WARNING, "could not determine address")
+SIZE = 1024
+COMMAND = "/"
 CLIENT = "client"
 SERVER = "server"
-SERVER_SHUTDOWN = "server_shutdown"
-CLIENT_JOIN = "client_join"
-CLIENT_LEAVE = "client_leave"
 
 class Handler:
     """Handler class for connected clients. Sends and receives messages, and
@@ -69,7 +62,7 @@ class Handler:
         self.socket = socket
         self.address = address
         self.server = server
-        self.active = True
+        self.active = False
         logging.log(DEBUG, "%s: initialized" % repr(self))
 
     def __repr__(self):
@@ -93,13 +86,17 @@ class Handler:
                 message["handler"] = self
                 self.server.messages.put(message)
             except Exception as e:
-                logging.log(ERROR, "%s: %s in recieve" % (
-                    repr(self), type(e).__name__))
-                self.shutdown()
+                if self.active:
+                    logging.log(ERROR, "%s: %s in recieve" % (
+                        repr(self), type(e).__name__))
+                    self.shutdown()
 
     # Main
     def activate(self):
         """Activate the handler."""
+        if self.active:
+            logging.log(WARNING, "%s: already activated" % repr(self))
+            return
         self.active = True
         self.recieve_thread = threading.Thread(target=self.recieve)
         self.recieve_thread.start()
@@ -108,10 +105,13 @@ class Handler:
 
     def shutdown(self):
         """Shut down the handler."""
+        if not self.active:
+            logging.log(WARNING, "%s: already shut down" % repr(self))
+            return            
         self.active = False
         self.server.handlers.remove(self)
         logging.log(INFO, "%s: shut down" % repr(self))
-    
+
 class Server:
     """Chat server that utilizes handlers to interact with the connected
     clients via sockets."""
@@ -158,8 +158,9 @@ class Server:
                 handler = Handler(socket, address, self)
                 handler.activate()
             except Exception as e:
-                logging.log(ERROR, "%s: %s in listen" % (
-                    repr(self), type(e).__name__))
+                if self.active:
+                    logging.log(ERROR, "%s: %s in listen" % (
+                        repr(self), type(e).__name__))
                 
     def serve(self):
         """Main server loop handles incoming messages and handles them."""
@@ -168,18 +169,33 @@ class Server:
             try:
                 while not self.messages.empty():
                     message = self.messages.get()
-                    message.pop("handler")
-                    data = encode(message)
-                    self.send(data)
+                    if message["message"].startswith(COMMAND):
+                        if message["message"] == COMMAND + "join":
+                            new = Message(
+                                type=SERVER, message="*%s joined*",
+                                time=message["time"])
+                            self.send(new)
+                        elif message["message"] == COMMAND + "quit":
+                            new = Message(
+                                type=SERVER, message="*%s quit*",
+                                time=message.time())
+                            self.send(new)
+                        return
+                    message.pop("handler") # Can't be pickled
+                    self.send(message)
             except Exception as e:
-                logging.log(ERROR, "%s: %s in serve" % (
-                    repr(self), type(e).__name__))
+                if self.active:
+                    logging.log(ERROR, "%s: %s in serve" % (
+                        repr(self), type(e).__name__))
 
     # Main
     def activate(self):
         """Activate the handler."""
         if self.failed:
-            logging.log(ERROR, "%s cannot be activated")
+            logging.log(ERROR, "%s: failed to activate" % repr(self))
+            return
+        if self.active:
+            logging.log(ERROR, "%s: already activated" % repr(self))
             return
         self.active = True
         self.listen_thread = threading.Thread(target=self.listen)
@@ -194,21 +210,24 @@ class Server:
 
     def shutdown(self):
         """Server shut down."""
+        if not self.active:
+            logging.log(ERROR, "%s: already shut down" % repr(self))
         self.active = False
         message = Message(
-            type=SERVER, message=SERVER_SHUTDOWN, time=time.time())
-        data = encode(message)
-        self.send(data)
+            type=SERVER, message=COMMAND + "shutdown", time=time.time())
+        self.send(message)
         for handler in self.handlers:
             handler.shutdown()
         self.socket.close()
-        logging.log(INFO, "%s shut down" % repr(self))
+        logging.log(INFO, "%s: shut down" % repr(self))
 
 def server(address=("127.0.0.1", 50000)):
     server = Server(address)
     server.activate()
 
 # Client
+BOLD_PATTERN = None
+
 class Client:
     """Chat client that interacts with the chat server via sockets."""
 
@@ -268,16 +287,21 @@ class Client:
 
     def input(self, event=None):
         """Get input from graphical interface."""
-        text = self.entry.get("1.0", "end")
-        self.entry.delete("1.0", "end")
-        message = Message(
-            name=self.name, type=CLIENT, message=text, time=time.time())
-        self.send(message)
+        if not event.state:
+            text = self.entry.get("1.0", "end-1c") # -1c for trailing \n
+            self.entry.delete("1.0", "end")
+            message = Message(
+                name=self.name, type=CLIENT, message=text, time=time.time())
+            self.send(message)
+            return "break"
 
     def print(self, string, end="\n"):
         """Print a string to the graphical interface."""
         self.text.config(state="normal")
         self.text.insert("end", string + end)
+
+        
+        
         self.text.config(state="disabled")
 
     def clear(self):
@@ -303,18 +327,18 @@ class Client:
 
     def update(self):
         """Update the graphical interface with any new messages."""
-        if not self.active: # Cheap catch since threads can't interact with tk
+        if not self.active and not self.popup:
             self.unbuild()
         while not self.messages.empty():
-            data = self.messages.get()
-            message = decode(data)
+            message = self.messages.get()
+            MESSAGE = CLIENT_MESSAGE
             if message.get("type") == SERVER:
-                if message["message"] == SERVER_SHUTDOWN:
-                    tkinter.messagebox.showinfo(
-                        title="Chat", message="The chat server has closed.",
-                        parent=self.root)
+                if message["message"] == COMMAND + "shutdown":
+                    logging.log(FATAL, "%s: server shut down" % repr(self))
                     self.shutdown()
                     return
+                else:
+                    MESSAGE = SERVER_MESSAGE
             time_ = time.localtime(message["time"])
             message_ = time.strftime(MESSAGE, time_) % message
             self.print(message_)
@@ -324,7 +348,10 @@ class Client:
     def activate(self):
         """Activate the client."""        
         if self.failed:
-            logging.log(ERROR, "%s: cannot be activated" % repr(self))
+            logging.log(ERROR, "%s: failed to activate" % repr(self))
+            return
+        if self.active:
+            logging.log(ERROR, "%s: already activated" % repr(self))
             return
         self.active = True
         self.receive_thread = threading.Thread(target=self.receive)
@@ -336,12 +363,16 @@ class Client:
     def shutdown(self):
         """Shut down the client."""
         if not self.active:
-            logging.log(WARNING, "%s: cannot be shut down" % repr(self))
+            logging.log(WARNING, "%s: already shut down" % repr(self))
             return
         self.active = False
-        self.socket.shutdown(0)
+        try:
+            self.socket.shutdown(0)
+        except:
+            logging.log(FATAL, "%s: server shut down" % repr(self))
         logging.log(DEBUG, "%s: shut down" % repr(self))
 
 def client(address=("127.0.0.1", 50000), name="John Doe"):
     client = Client(address, name)
     client.activate()
+
