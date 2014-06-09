@@ -11,6 +11,7 @@ import queue
 import tkinter
 import tkinter.scrolledtext
 import tkinter.messagebox
+import time
 import re
 
 # Logging
@@ -63,6 +64,7 @@ class Handler:
         self.address = address
         self.server = server
         self.active = False
+        self.name = ""
         logging.log(DEBUG, "%s: initialized" % repr(self))
 
     def __repr__(self):
@@ -98,6 +100,14 @@ class Handler:
             logging.log(WARNING, "%s: already activated" % repr(self))
             return
         self.active = True
+        data = self.socket.recv(SIZE)
+        message = decode(data)
+        self.name = message["name"]
+        new = Message(
+            type=SERVER, message="*%s joined*" % self.name,
+            time=time.time(), handler=self)
+        time.sleep(0.01)
+        self.server.messages.put(new)
         self.recieve_thread = threading.Thread(target=self.recieve)
         self.recieve_thread.start()
         self.server.handlers.append(self)
@@ -109,6 +119,10 @@ class Handler:
             logging.log(WARNING, "%s: already shut down" % repr(self))
             return            
         self.active = False
+        new = Message(
+            type=SERVER, message="*%s quit*" % self.name,
+            time=time.time(), handler=self)
+        self.server.messages.put(new)
         self.server.handlers.remove(self)
         logging.log(INFO, "%s: shut down" % repr(self))
 
@@ -172,12 +186,14 @@ class Server:
                     if message["message"].startswith(COMMAND):
                         if message["message"] == COMMAND + "join":
                             new = Message(
-                                type=SERVER, message="*%s joined*",
+                                type=SERVER,
+                                message="*%s joined*" % message["name"],
                                 time=message["time"])
                             self.send(new)
                         elif message["message"] == COMMAND + "quit":
                             new = Message(
-                                type=SERVER, message="*%s quit*",
+                                type=SERVER,
+                                message="*%s quit*" % message["name"],
                                 time=message.time())
                             self.send(new)
                         return
@@ -226,7 +242,10 @@ def server(address=("127.0.0.1", 50000)):
     server.activate()
 
 # Client
-BOLD_PATTERN = None
+ESCAPE_RE = r"(?P<escape>\\(.))"
+BOLD_RE = r"(?P<bold>\*([^\*]+)\*)"
+ITALICS_RE = r"(?P<italics>_([^_]+)_)"
+COMPILED_RE = "|".join((ESCAPE_RE, BOLD_RE, ITALICS_RE))
 
 class Client:
     """Chat client that interacts with the chat server via sockets."""
@@ -298,10 +317,8 @@ class Client:
     def print(self, string, end="\n"):
         """Print a string to the graphical interface."""
         self.text.config(state="normal")
+        start = self.text.index("end")        
         self.text.insert("end", string + end)
-
-        
-        
         self.text.config(state="disabled")
 
     def clear(self):
@@ -327,7 +344,7 @@ class Client:
 
     def update(self):
         """Update the graphical interface with any new messages."""
-        if not self.active and not self.popup:
+        if not self.active:
             self.unbuild()
         while not self.messages.empty():
             message = self.messages.get()
@@ -344,7 +361,7 @@ class Client:
             self.print(message_)
         self.root.after(50, self.update)
     
-    # Main
+    # Main       
     def activate(self):
         """Activate the client."""        
         if self.failed:
@@ -354,6 +371,9 @@ class Client:
             logging.log(ERROR, "%s: already activated" % repr(self))
             return
         self.active = True
+        message = Message(
+            name=self.name, type=CLIENT, message="/join", time=time.time())
+        self.send(message)
         self.receive_thread = threading.Thread(target=self.receive)
         self.receive_thread.start()
         logging.log(DEBUG, "%s: update loop started" % repr(self))
@@ -366,6 +386,9 @@ class Client:
             logging.log(WARNING, "%s: already shut down" % repr(self))
             return
         self.active = False
+        message = Message(
+            name=self.name, type=CLIENT, message="/quit", time=time.time())
+        self.send(message)
         try:
             self.socket.shutdown(0)
         except:
