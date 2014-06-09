@@ -1,202 +1,401 @@
-# Chat
-# Noah Kim, Haron Adbaru
-
-# For Africa!
+# PyChat
+# Noah K, Haron A
 
 # Import
+import logging
+import pickle
+import time
+import socket
+import threading
+import queue
 import tkinter
 import tkinter.scrolledtext
 import tkinter.messagebox
-
-import socket
-import threading
-
-import pickle
-import queue
-import logging
 import time
+import re
 
-# Debug
+# Logging
 from logging import FATAL, CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET
-logging.basicConfig(format="[%(asctime)s] %(levelname)-8s %(message)s",
-                    datefmt="%H:%M:%S", level=NOTSET)
+FORMAT = "%(asctime)s %(levelname)s: %(message)s"
+DATEFMT = "%m/%d/%y %I:%M:%S %p"
+LEVEL = NOTSET
+logging.basicConfig(format=FORMAT, datefmt=DATEFMT, level=LEVEL)
 
-# Constant
-RECV = 1024
+# Utility
+def censor(ip, parts=2) -> str:
+    """Censor an ip for privacy. Specify how much to censor with PARTS. No error
+    checking implemented."""
+    return ".".join(ip.split(".")[:-parts] + parts * ["***"])
 
-# Function
-def message(name=None, type=None, data=None, time=time.strftime("%I:%M %p")):
-    return {
-        "name": name,
-        "type": type,
-        "data": data,
-        "time": time
-    }
+# Message
+CLIENT_MESSAGE = "[%I:%M %p] *%%(name)s*: %%(message)s"
+SERVER_MESSAGE = "[%I:%M %p] %%(message)s"
 
-def hide(ip):
-    return ".".join(ip.split(".")[:2] + ["xxx",] * 2)
+def Message(**data) -> dict:
+    """Convenience function for generating messages. Also generates creation
+    time of the message."""
+    return data
 
-# Class
-class Client:
-    def __init__(self, address, name):
-        self.address = address
-        self.name = name
-        self.messages = queue.Queue()
-        self.alive = False
-        logging.log(INFO, "%s initialized" % repr(self))
+def encode(message) -> bytes:
+    """Convenience function for encoding messages for sending."""
+    return pickle.dumps(message)
 
-    def __repr__(self):
-        return "Client<%s:%d>" % self.address
+def decode(message) -> dict:
+    """Convenience function for decoding messages for receiving."""
+    return pickle.loads(message)
 
-    def connect(self):
-        try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.connect(self.address)
-            logging.log(INFO, "%s connected" % repr(self))            
-        except OSError as e:
-            logging.log(FATAL, "%s could not connect (%s)" % (
-                repr(self), type))
-
-    def send(self, message):
-        data = pickle.dumps(message)
-        self.socket.send(data)
-
-    def recv(self):
-        logging.log(INFO, "%s recv loop started" % repr(self))
-        while self.alive:
-            try:
-                data = self.socket.recv(RECV)
-                message = pickle.loads(data)
-                self.messages.put(message)
-            except Exception as e:
-                logging.log(ERROR, "%s %s in recv loop" % (
-                    repr(self), str(e)))
-                self.shutdown()
-
-    def update(self):
-        while self.active:
-            try:
-                if not self.messages.empty():
-                    message = self.messages.get()
-                    self.handle(message)
-            except Exception as e:
-                logging.log(ERROR, "%s %s in update loop" % (
-                    repr(self), type(e).__name__))
-
-    def handle(self, message):
-        print(message)
+# Server
+try: IP, PORT = socket.gethostbyname(socket.gethostname()), 50000
+except: logging.log(WARNING, "could not determine address")
+SIZE = 1024
+COMMAND = "/"
+CLIENT = "client"
+SERVER = "server"
 
 class Handler:
+    """Handler class for connected clients. Sends and receives messages, and
+    interacts directly with the server."""
+
+    # Magic
     def __init__(self, socket, address, server):
+        """Initialize a new handler based on the socket connection and chat
+        server."""
         self.socket = socket
         self.address = address
         self.server = server
-        self.signature = {"handler": self}
-        self.alive = False
-        logging.log(INFO, "%s initialized" % repr(self))
+        self.active = False
+        self.name = ""
+        logging.log(DEBUG, "%s: initialized" % repr(self))
 
     def __repr__(self):
-        return "Handler<%s:%d>" % self.address
+        """Return repr(handler)."""
+        return "Handler<%s>" % self.address[0]
 
+    # Single
     def send(self, message):
-        data = pickle.dumps(message)
+        """Send a message to the connected client."""
+        data = encode(message)
         self.socket.send(data)
-        logging.log(DEBUG, "%s sent message" % repr(self))
 
-    def recv(self):
-        logging.log(INFO, "%s recv loop started" % repr(self))
-        while self.alive:
+    # Loop
+    def recieve(self):
+        """Loop receive data from the connected client."""
+        logging.log(DEBUG, "%s: recieve loop started" % repr(self))
+        while self.active:
             try:
-                data = self.socket.recv(RECV)
-                message = pickle.loads(data)
-                message.update(self.signature)
+                data = self.socket.recv(SIZE)
+                message = decode(data)
+                message["handler"] = self
                 self.server.messages.put(message)
             except Exception as e:
-                logging.log(ERROR, "%s %s in recv loop" % (
-                    repr(self), str(e)))
-                self.shutdown()
+                if self.active:
+                    logging.log(ERROR, "%s: %s in recieve" % (
+                        repr(self), type(e).__name__))
+                    self.shutdown()
 
+    # Main
     def activate(self):
-        self.alive = True
-        self.recv_thread = threading.Thread(target=self.recv)
-        self.recv_thread.start()
+        """Activate the handler."""
+        if self.active:
+            logging.log(WARNING, "%s: already activated" % repr(self))
+            return
+        self.active = True
+        data = self.socket.recv(SIZE)
+        message = decode(data)
+        self.name = message["name"]
+        new = Message(
+            type=SERVER, message="*%s joined*" % self.name,
+            time=time.time(), handler=self)
+        time.sleep(0.01)
+        self.server.messages.put(new)
+        self.recieve_thread = threading.Thread(target=self.recieve)
+        self.recieve_thread.start()
         self.server.handlers.append(self)
-        logging.log(INFO, "%s activated" % repr(self))
+        logging.log(INFO, "%s: activated" % repr(self))
 
     def shutdown(self):
-        self.alive = False
-        self.socket.close()
+        """Shut down the handler."""
+        if not self.active:
+            logging.log(WARNING, "%s: already shut down" % repr(self))
+            return            
+        self.active = False
+        new = Message(
+            type=SERVER, message="*%s quit*" % self.name,
+            time=time.time(), handler=self)
+        self.server.messages.put(new)
         self.server.handlers.remove(self)
-        logging.log(INFO, "%s shut down" % repr(self))
+        logging.log(INFO, "%s: shut down" % repr(self))
 
 class Server:
+    """Chat server that utilizes handlers to interact with the connected
+    clients via sockets."""
+
+    # Magic
     def __init__(self, address):
+        """Initialize a new chat server on an address."""
         self.address = address
         self.messages = queue.Queue()
         self.handlers = list()
-        self.alive = False
-        logging.log(INFO, "%s initialized" % repr(self))
-
-    def __repr__(self):
-        return "Server<%s:%d>" % self.address
-
-    def bind(self):
+        self.active = False
+        self.failed = False
         try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket = socket.socket()
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.bind(self.address)
             self.socket.listen(5)
-            logging.log(INFO, "%s bound" % repr(self))            
+            logging.log(DEBUG, "%s: bound" % repr(self))
         except OSError as e:
-            logging.log(FATAL, "%s could not bind (%s)" % (
-                repr(self), str(e)))
+            logging.log(FATAL, "%s: could not bind" % repr(self))
+            self.failed = True
+        logging.log(DEBUG, "%s: initialized" % repr(self))
 
+    def __repr__(self):
+        """Return repr(server)."""
+        return "Server<%s>" % self.address[0]
+
+    # Single
     def send(self, message, handler=None):
+        """Broadcast a message or send it to a specific handler."""
         if handler:
             handler.send(message)
         else:
             for handler in self.handlers:
                 handler.send(message)
 
-    def handle(self, mesage):
-        print(message)
-
-    def search(self):
-        logging.log(INFO, "%s search loop started" % repr(self))
-        while self.alive:
+    # Loop
+    def listen(self):
+        """Listen for incoming connections from possible clients."""        
+        logging.log(DEBUG, "%s: listen loop started" % repr(self))
+        while self.active:
             try:
                 socket, address = self.socket.accept()
                 handler = Handler(socket, address, self)
                 handler.activate()
             except Exception as e:
-                logging.log(ERROR, "%s search loop: %s" % (
-                    repr(self), type(e).__name__))
-
-    def serve(self):
-        logging.log(INFO, "%s serve loop started" % repr(self))
-        while self.alive:
-            try:
-                if not self.messages.empty():
-                    message = self.messages.get()
-                    self.handle(message)
-            except Exception as e:
-                logging.log(ERROR, "%s serve loop: %s" % (
-                    repr(self), type(e).__name__))
+                if self.active:
+                    logging.log(ERROR, "%s: %s in listen" % (
+                        repr(self), type(e).__name__))
                 
+    def serve(self):
+        """Main server loop handles incoming messages and handles them."""
+        logging.log(DEBUG, "%s: serve loop started" % repr(self))
+        while self.active:
+            try:
+                while not self.messages.empty():
+                    message = self.messages.get()
+                    if message["message"].startswith(COMMAND):
+                        if message["message"] == COMMAND + "join":
+                            new = Message(
+                                type=SERVER,
+                                message="*%s joined*" % message["name"],
+                                time=message["time"])
+                            self.send(new)
+                        elif message["message"] == COMMAND + "quit":
+                            new = Message(
+                                type=SERVER,
+                                message="*%s quit*" % message["name"],
+                                time=message.time())
+                            self.send(new)
+                        return
+                    message.pop("handler") # Can't be pickled
+                    self.send(message)
+            except Exception as e:
+                if self.active:
+                    logging.log(ERROR, "%s: %s in serve" % (
+                        repr(self), type(e).__name__))
+
+    # Main
     def activate(self):
-        self.alive = True
-        self.bind()
-        self.search_thread = threading.Thread(target=self.search)
-        self.search_thread.start()
-        logging.log(INFO, "%s activated" % repr(self))
+        """Activate the handler."""
+        if self.failed:
+            logging.log(ERROR, "%s: failed to activate" % repr(self))
+            return
+        if self.active:
+            logging.log(ERROR, "%s: already activated" % repr(self))
+            return
+        self.active = True
+        self.listen_thread = threading.Thread(target=self.listen)
+        self.listen_thread.start()
+        logging.log(INFO, "%s: activated" % repr(self))
         try:
+            logging.log(INFO, "%s: type ctrl-c to shut down" % repr(self))
             self.serve()
         except KeyboardInterrupt:
-            logging.log(WARNING, "%s receiver KeyboardInterrupt" %
-                        repr(self))
+            logging.log(INFO, "%s: received ctrl-c" % repr(self))
             self.shutdown()
 
     def shutdown(self):
-        self.alive = False
+        """Server shut down."""
+        if not self.active:
+            logging.log(ERROR, "%s: already shut down" % repr(self))
+        self.active = False
+        message = Message(
+            type=SERVER, message=COMMAND + "shutdown", time=time.time())
+        self.send(message)
+        for handler in self.handlers:
+            handler.shutdown()
         self.socket.close()
-        logging.log(INFO, "%s shut down" % repr(self))
+        logging.log(INFO, "%s: shut down" % repr(self))
+
+def server(address=("127.0.0.1", 50000)):
+    server = Server(address)
+    server.activate()
+
+# Client
+ESCAPE_RE = r"(?P<escape>\\(.))"
+BOLD_RE = r"(?P<bold>\*([^\*]+)\*)"
+ITALICS_RE = r"(?P<italics>_([^_]+)_)"
+COMPILED_RE = "|".join((ESCAPE_RE, BOLD_RE, ITALICS_RE))
+
+class Client:
+    """Chat client that interacts with the chat server via sockets."""
+
+    # Magic
+    def __init__(self, address, name):
+        """Initialize a new, named client connecting to a server address."""
+        self.address = address
+        self.name = name
+        self.messages = queue.Queue()
+        self.active = False
+        self.failed = False
+        try:
+            self.socket = socket.socket()
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.connect(self.address)
+            logging.log(DEBUG, "%s: bound" % repr(self))
+        except OSError as e:
+            logging.log(FATAL, "%s: could not connect" % repr(self))
+            self.failed = True
+        logging.log(DEBUG, "%s: initialized" % repr(self))
+
+    def __repr__(self):
+        """Return repr(self)."""
+        return "Client<%s>" % self.address[0]
+
+    # Single
+    def send(self, message):
+        """Send a message to the connected server."""
+        data = encode(message)
+        self.socket.send(data)
+
+    # Graphical
+    def build(self):
+        """Build the graphical interface."""
+        self.root = tkinter.Tk()
+        self.root.title("Chat")
+        self.text = tkinter.scrolledtext.ScrolledText(
+            self.root, bd=1, width=40, relief="sunken",
+            state="disabled", font=("Verdana", 0))
+        self.text.pack(fill="both", expand=2)
+        self.text.config(height=30)
+        self.entry = tkinter.Text(
+            self.root, bd=1, width=40, height=3, relief="sunken",
+            highlightcolor="white", font=("Verdana", 0))
+        self.entry.pack(fill="x")
+        logging.log(DEBUG, "%s: built" % repr(self))
+        self.entry.bind("<Return>", self.input)
+        self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
+        self.update()
+        self.root.mainloop()
+
+    def unbuild(self):
+        """Un-build the graphical interface."""
+        self.root.quit()
+        self.root.destroy()
+        logging.log(DEBUG, "%s: unbuilt" % repr(self))
+
+    def input(self, event=None):
+        """Get input from graphical interface."""
+        if not event.state:
+            text = self.entry.get("1.0", "end-1c") # -1c for trailing \n
+            self.entry.delete("1.0", "end")
+            message = Message(
+                name=self.name, type=CLIENT, message=text, time=time.time())
+            self.send(message)
+            return "break"
+
+    def print(self, string, end="\n"):
+        """Print a string to the graphical interface."""
+        self.text.config(state="normal")
+        start = self.text.index("end")        
+        self.text.insert("end", string + end)
+        self.text.config(state="disabled")
+
+    def clear(self):
+        """Clear the entire graphical interface."""
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.config(state="disabled")
+
+    # Loop
+    def receive(self):
+        """Loop receive data from the connected client."""
+        logging.log(DEBUG, "%s: recieve loop started" % repr(self))
+        while self.active:
+            try:
+                data = self.socket.recv(SIZE)
+                message = decode(data)
+                self.messages.put(message)
+            except Exception as e:
+                logging.log(ERROR, "%s: %s in recieve" % (
+                    repr(self), type(e).__name__))
+                if self.active:
+                    self.shutdown()
+
+    def update(self):
+        """Update the graphical interface with any new messages."""
+        if not self.active:
+            self.unbuild()
+        while not self.messages.empty():
+            message = self.messages.get()
+            MESSAGE = CLIENT_MESSAGE
+            if message.get("type") == SERVER:
+                if message["message"] == COMMAND + "shutdown":
+                    logging.log(FATAL, "%s: server shut down" % repr(self))
+                    self.shutdown()
+                    return
+                else:
+                    MESSAGE = SERVER_MESSAGE
+            time_ = time.localtime(message["time"])
+            message_ = time.strftime(MESSAGE, time_) % message
+            self.print(message_)
+        self.root.after(50, self.update)
+    
+    # Main       
+    def activate(self):
+        """Activate the client."""        
+        if self.failed:
+            logging.log(ERROR, "%s: failed to activate" % repr(self))
+            return
+        if self.active:
+            logging.log(ERROR, "%s: already activated" % repr(self))
+            return
+        self.active = True
+        message = Message(
+            name=self.name, type=CLIENT, message="/join", time=time.time())
+        self.send(message)
+        self.receive_thread = threading.Thread(target=self.receive)
+        self.receive_thread.start()
+        logging.log(DEBUG, "%s: update loop started" % repr(self))
+        logging.log(DEBUG, "%s: activated" % repr(self))
+        self.build()
+        
+    def shutdown(self):
+        """Shut down the client."""
+        if not self.active:
+            logging.log(WARNING, "%s: already shut down" % repr(self))
+            return
+        self.active = False
+        message = Message(
+            name=self.name, type=CLIENT, message="/quit", time=time.time())
+        self.send(message)
+        try:
+            self.socket.shutdown(0)
+        except:
+            logging.log(FATAL, "%s: server shut down" % repr(self))
+        logging.log(DEBUG, "%s: shut down" % repr(self))
+
+def client(address=("127.0.0.1", 50000), name="John Doe"):
+    client = Client(address, name)
+    client.activate()
+
